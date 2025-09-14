@@ -1,2 +1,2 @@
 # eeg-cnn
-Preprocessing, training and evaluation pipeline for EEG classification. Model labels EEG data as abnormal or normal at the desired sampling rate.
+Preprocessing, data augmentation, training and evaluation pipeline for EEG classification. Model will predict abnormal or normal for 10 second EEG segments at the desired sampling rate.
