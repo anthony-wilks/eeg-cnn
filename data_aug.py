@@ -1,19 +1,3 @@
-"""
-EEG augmentation using max safe shift per file (no fixed shift list):
-- Inputs:
-  * Signals: ./data/preprocessed/train/<name>.npy of shape (S, 22, 2560)
-  * Labels : ./data/labels/train/<name>.npy      of shape (S, 22, 2560) (binary)
-- For each label file containing ≥1 event:
-  * Compute per-segment event bounds (across channels); ignore segments with no events
-  * Max safe left shift (samples)  = min(start_idx across event segments)
-  * Max safe right shift (samples) = min((T-1)-end_idx across event segments)
-  * Create augments for:
-      - left shift by max_left (if > 0)
-      - right shift by max_right (if > 0)
-    and for each, scale the signal by each factor in SCALES (labels are not scaled)
-  * Save signal & label pairs with matching suffixes
-"""
-
 from pathlib import Path
 import numpy as np
 
@@ -36,11 +20,6 @@ def any_event(labels_file: np.ndarray) -> bool:
     return np.any(labels_file == 1)
 
 def event_bounds_per_segment(lbl_seg: np.ndarray):
-    """
-    lbl_seg: (22, T) binary
-    Returns (start_idx, end_idx) for this segment if any event exists, else None.
-    Event is defined as any channel active at a time sample (union across channels).
-    """
     time_any = lbl_seg.any(axis=0)  # (T,)
     if not time_any.any():
         return None
@@ -48,10 +27,6 @@ def event_bounds_per_segment(lbl_seg: np.ndarray):
     return int(idx[0]), int(idx[-1])
 
 def safe_shift_caps(labels_file: np.ndarray):
-    """
-    Compute maximum safe left/right shift (samples) across all segments with events.
-    Segments without events do not constrain the caps.
-    """
     left_caps, right_caps = [], []
     for s in range(labels_file.shape[0]):
         bounds = event_bounds_per_segment(labels_file[s])
@@ -65,7 +40,6 @@ def safe_shift_caps(labels_file: np.ndarray):
     return int(min(left_caps)), int(min(right_caps))
 
 def roll_time(arr: np.ndarray, k: int) -> np.ndarray:
-    """Roll along time axis (last axis). Positive k = shift right; negative = left."""
     return np.roll(arr, k, axis=-1)
 
 def names_with_suffix(sig_path: Path, lab_path: Path, direction: str, shift_samples: int, scale: float):
@@ -79,10 +53,6 @@ def names_with_suffix(sig_path: Path, lab_path: Path, direction: str, shift_samp
 
 def apply_and_save_shift(direction, shift_samples, signal, labels, sig_path, lab_path,
                          saved_pairs_ref, skipped_existing_ref):
-    """
-    Apply a given shift (samples) left or right, then save all scale variants.
-    Updates counters by reference (ints wrapped in list).
-    """
     if shift_samples <= 0:
         return
     k = -shift_samples if direction == 'l' else shift_samples

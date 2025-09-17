@@ -1,152 +1,253 @@
-"""
-rec_to_npy_structured.py
-------------------------
-Convert .rec annotation files into dense binary label arrays (.npy),
-sized to EDF duration, sampled at 256 Hz with 22 channels.
-
-- .rec under: edf/train/**, edf/eval/**, edf/test/**
-- .edf under: raw/train/**, raw/eval/**, raw/test/** (same stem as .rec)
-- Output: npy/<split>/<same relative path under split>/<stem>.npy
-
-So if EDF is raw/test/patient1/session/file.edf,
-labels are saved to npy/test/patient1/session/file.npy
-"""
-
 from __future__ import annotations
 import argparse
-import math
 import sys
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import Tuple, List, Optional
+
 import numpy as np
 
 try:
     import pyedflib
 except ImportError:
-    print("Error: pyedflib is required. Install with: pip install pyedflib", file=sys.stderr)
-    raise
+    pyedflib = None  # We'll warn and fall back if unavailable
 
-POSITIVE_LABELS = {1, 2, 3}   # spsw, gped, pled
-FS = 256                      # fixed label sampling rate
-N_CHANNELS = 22                # fixed channel count
+# Paths
+NPY_ROOT = Path("./npy")
+OUT_ROOT = Path("./label")
+RAW_ROOT = Path("./raw")
+SPLITS = ("train", "eval", "test")
 
+# Constants
+TARGET_FS_DEFAULT = 256
+TRIM_SECONDS_DEFAULT = 60
+SEGMENT_SECONDS_DEFAULT = 10
 
-def read_rec(rec_path: Path) -> List[Tuple[int, float, float, int]]:
-    """Parse .rec into list of (channel, start_sec, stop_sec, label_int)."""
-    events: List[Tuple[int, float, float, int]] = []
-    with rec_path.open("r", newline="") as f:
-        for raw in f:
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = [c.strip() for c in line.split(",") if c.strip()]
-            if len(parts) < 4:
-                continue
-            try:
-                ch = int(parts[0]); start = float(parts[1]); stop = float(parts[2]); label = int(parts[3])
-            except Exception:
-                continue
-            if stop < start:
-                start, stop = stop, start
-            events.append((ch, start, stop, label))
-    return events
+# ----------------- Resampling -----------------
+def _resample_1d_binary(x: np.ndarray, fs_in: float, fs_out: float) -> np.ndarray:
+    """Nearest-neighbor resample of a 1D binary signal to avoid label bleeding."""
+    if fs_in == fs_out or len(x) == 0:
+        return x.astype(np.float32, copy=False)
+    T_out = int(round(len(x) * fs_out / fs_in))
+    scale = fs_in / fs_out
+    idx = np.clip((np.arange(T_out) * scale).round().astype(np.int64), 0, len(x) - 1)
+    return x[idx].astype(np.float32, copy=False)
 
+def resample_labels_TxC(arr_TxC: np.ndarray, fs_in: float, fs_out: float) -> np.ndarray:
+    if fs_in == fs_out:
+        return arr_TxC
+    T_out = int(round(arr_TxC.shape[0] * fs_out / fs_in))
+    out = np.empty((T_out, arr_TxC.shape[1]), dtype=np.float32)
+    for c in range(arr_TxC.shape[1]):
+        out[:, c] = _resample_1d_binary(arr_TxC[:, c], fs_in, fs_out)
+    return out
 
-def edf_duration_seconds(edf_path: Path) -> float:
-    """Read EDF header to get full duration in seconds."""
-    with pyedflib.EdfReader(str(edf_path)) as f:
-        return float(f.getFileDuration())
+# ----------------- Trimming & Segmenting -----------------
+def trim_edges_TxC(arr_TxC: np.ndarray, fs: int, trim_seconds: int) -> np.ndarray:
+    trim_pts = int(fs * trim_seconds)
+    if arr_TxC.shape[0] > 2 * trim_pts:
+        return arr_TxC[trim_pts:-trim_pts]
+    return arr_TxC
 
+def segment_TxC_to_NCT(
+    arr_TxC: np.ndarray,
+    fs: int | float,
+    segment_seconds: int,
+    n_channels_expected: int = 22,
+    pad: bool = True,
+) -> np.ndarray:
+    """(T, C) -> (N, C, Tseg) with optional tail padding."""
+    if arr_TxC.ndim != 2:
+        raise ValueError(f"Expected 2D (T,C), got {arr_TxC.shape}")
+    T, C = arr_TxC.shape
+    if C != n_channels_expected:
+        print(f"[WARN] Channels = {C} (expected {n_channels_expected}); proceeding.", file=sys.stderr)
+    Tseg = int(round(float(fs) * float(segment_seconds)))
+    if Tseg <= 0:
+        raise ValueError(f"Computed non-positive segment length: {Tseg}")
+    if T < Tseg:
+        if pad:
+            pad_amt = Tseg - T
+            arr_TxC = np.pad(arr_TxC, ((0, pad_amt), (0, 0)), mode='constant')
+            T = arr_TxC.shape[0]
+        else:
+            return np.zeros((0, C, Tseg), dtype=arr_TxC.dtype)
 
-def build_binary_array(events: List[Tuple[int, float, float, int]], duration_sec: float) -> np.ndarray:
-    """Dense (samples, channels) array at 256 Hz across EDF duration."""
-    n_samples = max(1, int(round(duration_sec * FS)))
-    arr = np.zeros((n_samples, N_CHANNELS), dtype=np.uint8)
-    for ch, start, stop, label in events:
-        if label not in POSITIVE_LABELS:
-            continue
-        if not (0 <= ch < N_CHANNELS):
-            continue
-        start_idx = max(0, int(math.floor(start * FS)))
-        stop_idx  = min(n_samples, int(math.ceil(stop * FS)))
-        if stop_idx > start_idx:
-            arr[start_idx:stop_idx, ch] = 1
-    return arr
+    N = T // Tseg
+    remainder = T % Tseg
+    if remainder != 0 and pad:
+        pad_amt = Tseg - remainder
+        arr_TxC = np.pad(arr_TxC, ((0, pad_amt), (0, 0)), mode='constant')
+        T = arr_TxC.shape[0]
+        N = T // Tseg
 
+    trimmed = arr_TxC[: N * Tseg]
+    out = trimmed.reshape(N, Tseg, C).transpose(0, 2, 1)  # (N, C, Tseg)
+    return out
 
-def infer_split(rec_path: Path, edf_root: Path) -> Optional[str]:
-    """Infer split (train/eval/test) from rec_path under edf_root."""
+# ----------------- IO & EDF duration discovery -----------------
+def load_TxC(path: Path) -> Tuple[np.ndarray, bool]:
+    arr = np.load(path)
+    transposed = False
+    if arr.ndim != 2:
+        raise ValueError(f"{path}: expected 2D label array, got {arr.shape}")
+    # Auto (22,T) -> (T,22)
+    if arr.shape[0] == 22 and arr.shape[1] != 22:
+        arr = arr.T
+        transposed = True
+    elif arr.shape[1] != 22 and arr.shape[0] != 22:
+        # Ambiguous; assume (T,C)
+        pass
+    return arr.astype(np.float32, copy=False), transposed
+
+def save_NCT(path: Path, arr_NCT: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if arr_NCT.dtype != np.uint8:
+        arr_NCT = (arr_NCT > 0.5).astype(np.uint8, copy=False)
+    np.save(path, arr_NCT)
+
+def npy_to_edf_path(npy_root: Path, raw_root: Path, npy_path: Path) -> Path:
+    """Map npy/<split>/.../file.npy -> raw/<split>/.../file.edf"""
+    rel = npy_path.relative_to(npy_root).with_suffix(".edf")
+    return raw_root / rel
+
+def read_min_duration_sec_from_edf(edf_path: Path) -> Optional[float]:
+    """
+    Return the minimum channel duration in seconds from the EDF.
+    This is the common time base used by the EDF pipeline.
+    """
+    if pyedflib is None:
+        print("[ERROR] pyedflib not installed; cannot read EDF duration.", file=sys.stderr)
+        return None
+    if not edf_path.exists():
+        print(f"[WARN] EDF not found for labels: {edf_path}", file=sys.stderr)
+        return None
     try:
-        rel = rec_path.relative_to(edf_root)
-    except ValueError:
+        reader = pyedflib.EdfReader(str(edf_path))
+        try:
+            n_sig = reader.signals_in_file
+            if n_sig <= 0:
+                return None
+            durations = []
+            for i in range(n_sig):
+                fs = float(reader.getSampleFrequency(i))
+                n = int(reader.getNSamples()[i]) if hasattr(reader, "getNSamples") else len(reader.readSignal(i))
+                durations.append(n / max(fs, 1e-9))
+            return float(min(durations)) if durations else None
+        finally:
+            reader.close()
+    except Exception as e:
+        print(f"[WARN] Failed to read EDF {edf_path}: {e}", file=sys.stderr)
         return None
-    return rel.parts[0].lower() if rel.parts else None
 
+# ----------------- Per-file processing -----------------
+def process_one_file(
+    src: Path,
+    dst_root: Path,
+    npy_root: Path,
+    raw_root: Path,
+    cli_fs_in: float,
+    fs_out: float,
+    trim_seconds: int,
+    segment_seconds: int,
+) -> None:
+    # Destination path
+    rel = src.relative_to(npy_root)
+    dst = (dst_root / rel).with_suffix('.npy')
 
-def find_matching_edf(stem: str, raw_split_root: Path) -> Optional[Path]:
-    """Find <stem>.edf under raw/<split> recursively (case-insensitive)."""
-    candidates = list(raw_split_root.rglob(f"{stem}.edf")) + list(raw_split_root.rglob(f"{stem}.EDF"))
-    if not candidates:
-        return None
-    candidates.sort(key=lambda p: len(p.relative_to(raw_split_root).parts))
-    return candidates[0]
-
-
-def process_all(edf_root: Path, raw_root: Path, out_root: Path) -> None:
-    rec_files = list(edf_root.rglob("*.rec"))
-    if not rec_files:
-        print(f"No .rec files found under {edf_root}", file=sys.stderr)
+    try:
+        arr_TxC, transposed = load_TxC(src)  # (T_in_labels, C)
+    except Exception as e:
+        print(f"[FAIL] {src}: {e}", file=sys.stderr)
         return
 
-    print(f"Found {len(rec_files)} .rec files under {edf_root}")
-    processed = 0
+    T_in_labels = int(arr_TxC.shape[0])
 
-    for rec_path in rec_files:
-        split = infer_split(rec_path, edf_root)
-        if split not in {"train", "eval", "test"}:
-            print(f"Skipping {rec_path}, could not infer split.", file=sys.stderr)
+    # Discover EDF min duration (seconds)
+    edf_path = npy_to_edf_path(npy_root=npy_root, raw_root=raw_root, npy_path=src)
+    min_dur_sec = read_min_duration_sec_from_edf(edf_path)
+
+    if min_dur_sec is not None and min_dur_sec > 0:
+        # Infer labels' actual input fs from duration
+        fs_in_labels = float(T_in_labels) / float(min_dur_sec)
+        # Resample labels to target fs
+        arr_TxC = resample_labels_TxC(arr_TxC, fs_in=fs_in_labels, fs_out=fs_out)
+        # Hard-enforce exact time alignment to EDF duration at target fs
+        T_target = int(round(min_dur_sec * fs_out))
+        if arr_TxC.shape[0] < T_target:
+            pad_amt = T_target - arr_TxC.shape[0]
+            arr_TxC = np.pad(arr_TxC, ((0, pad_amt), (0, 0)), mode='constant')
+        elif arr_TxC.shape[0] > T_target:
+            arr_TxC = arr_TxC[:T_target]
+        debug_tag = f"(fs_in≈{fs_in_labels:.6g} Hz, min_dur={min_dur_sec:.3f}s, T_target={T_target})"
+    else:
+        # Fallback: use CLI fs_in (older behavior)
+        fs_in_labels = float(cli_fs_in)
+        arr_TxC = resample_labels_TxC(arr_TxC, fs_in=fs_in_labels, fs_out=fs_out)
+        debug_tag = f"(EDF missing → fallback fs_in={fs_in_labels} Hz)"
+
+    # Optional trim (keep consistent with EDF pipeline)
+    # arr_TxC = trim_edges_TxC(arr_TxC, fs=fs_out, trim_seconds=trim_seconds)
+
+    # Segment (with padding)
+    segs_NCT = segment_TxC_to_NCT(
+        arr_TxC, fs=fs_out, segment_seconds=segment_seconds, n_channels_expected=22, pad=True
+    )
+
+    # Save
+    save_NCT(dst, segs_NCT)
+    print(f"[OK] {src} -> {dst}  shape={segs_NCT.shape}  {debug_tag}")
+
+# ----------------- Discovery -----------------
+def list_label_npy_files(npy_root: Path) -> List[Path]:
+    files: List[Path] = []
+    for split in SPLITS:
+        root = npy_root / split
+        if not root.exists():
             continue
+        files.extend(root.rglob('*.npy'))
+    return sorted(files)
 
-        raw_split_root = raw_root / split
-        if not raw_split_root.exists():
-            print(f"Missing raw split folder {raw_split_root}, skipping {rec_path}", file=sys.stderr)
-            continue
-
-        stem = rec_path.stem
-        edf_path = find_matching_edf(stem, raw_split_root)
-        if edf_path is None:
-            print(f"No EDF found for {rec_path.name} in {raw_split_root}", file=sys.stderr)
-            continue
-
-        events = read_rec(rec_path)
-        try:
-            duration_sec = edf_duration_seconds(edf_path)
-        except Exception as e:
-            print(f"Failed to read EDF {edf_path}: {e}, skipping.", file=sys.stderr)
-            continue
-
-        arr = build_binary_array(events, duration_sec)
-
-        # Save under npy/<split>/<relative subpath from raw/<split>>/<stem>.npy
-        rel_subpath = edf_path.relative_to(raw_split_root).with_suffix(".npy")
-        out_path = out_root / split / rel_subpath
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-
-        np.save(out_path, arr)
-        print(f"Saved {out_path}  shape={arr.shape}  positives={arr.sum()}")
-        processed += 1
-
-    print(f"Done. Processed {processed} files.")
-
+# ----------------- CLI -----------------
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser(description="Preprocess dense label arrays: resample/trim/segment -> (N,22,2560)")
+    ap.add_argument('--npy-root', type=Path, default=NPY_ROOT, help='Root of dense labels (npy/{train,eval,test})')
+    ap.add_argument('--raw-root', type=Path, default=RAW_ROOT, help='Root of raw EDFs (raw/{train,eval,test})')
+    ap.add_argument('--out-root', type=Path, default=OUT_ROOT, help='Root to save segmented labels (label/{train,eval,test})')
+    ap.add_argument('--input-fs', type=float, default=TARGET_FS_DEFAULT, help='Fallback input label sampling rate (Hz) if EDF missing')
+    ap.add_argument('--target-fs', type=float, default=TARGET_FS_DEFAULT, help='Target label sampling rate (Hz), usually 256')
+    ap.add_argument('--trim-seconds', type=int, default=TRIM_SECONDS_DEFAULT, help='Trim this many seconds at both start and end (if long enough)')
+    ap.add_argument('--segment-seconds', type=int, default=SEGMENT_SECONDS_DEFAULT, help='Segment window length in seconds (10 -> 2560 samples @256 Hz)')
+    return ap.parse_args()
 
 def main():
-    parser = argparse.ArgumentParser(description="Convert .rec to dense binary .npy (22 ch @ 256 Hz) sized to EDF duration, preserving raw folder structure under split.")
-    parser.add_argument("--edf-dir", type=Path, default=Path("edf"), help="Root with .rec files (edf/train|eval|test).")
-    parser.add_argument("--raw-dir", type=Path, default=Path("raw"), help="Root with .edf files (raw/train|eval|test).")
-    parser.add_argument("--out-dir", type=Path, default=Path("npy"), help="Output root directory ('npy').")
-    args = parser.parse_args()
-    process_all(args.edf_dir, args.raw_dir, args.out_dir)
+    args = parse_args()
 
+    # Ensure split roots exist in the output
+    for split in SPLITS:
+        (args.out_root / split).mkdir(parents=True, exist_ok=True)
 
-if __name__ == "__main__":
+    files = list_label_npy_files(args.npy_root)
+    if not files:
+        print(f"No .npy label files found under {args.npy_root}/{{train,eval,test}}", file=sys.stderr)
+        sys.exit(1)
+
+    if pyedflib is None:
+        print("[WARN] pyedflib not installed; will use --input-fs fallback for all files (no EDF duration sync).", file=sys.stderr)
+
+    for src in files:
+        try:
+            process_one_file(
+                src=src,
+                dst_root=args.out_root,
+                npy_root=args.npy_root,
+                raw_root=args.raw_root,
+                cli_fs_in=float(args.input_fs),
+                fs_out=float(args.target_fs),
+                trim_seconds=int(args.trim_seconds),
+                segment_seconds=int(args.segment_seconds),
+            )
+        except Exception as e:
+            print(f"[FAIL] {src}: {e}", file=sys.stderr)
+
+if __name__ == '__main__':
     main()
